@@ -1,0 +1,18 @@
+# Essential
+.git
+.env
+
+# Windows
+*.lnk
+*.db
+*.ini
+
+# Temp
+/tmp
+
+# Local config
+.vscode
+.codex
+.agents
+agents.md
+docs/environment/local.md
