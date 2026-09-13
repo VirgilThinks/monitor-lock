@@ -36,6 +36,19 @@ Both endpoints of a barrier are included. This prevents a gap between adjacent b
 A diagonal movement can encounter a barrier and also travel beyond one of its endpoints in the same pointer update. Its perpendicular component remains blocked for the whole update, while its parallel component can slide beyond the endpoint. A subsequent pointer update can cross the edge beyond the barrier.
 
 
+## Collision model
+
+Barriers are directed, closed line segments. Each pointer update is treated as a swept segment from the last accepted pointer position to the position proposed by Windows.
+
+Monitor boundaries are represented in doubled integer coordinates. Cursor positions are even coordinates and the boundaries between pixels are odd coordinates. This represents every monitor edge exactly without placing the pointer on an ambiguous shared boundary.
+
+Collision times and percentage endpoints are represented as integer fractions and compared by cross-multiplication. Floating-point tolerances are not used. A 20% corner barrier is represented exactly as one fifth of its edge.
+
+Every barrier intersected at the earliest collision time is resolved together. This includes coincident barriers and the two adjacent barriers meeting at a corner. Movement components directed through any of those barriers are removed, while permitted parallel movement is retained.
+
+If parallel movement remaining after the first collision reaches another barrier during the same pointer update, that movement is swept again and the additional barrier is also applied.
+
+
 ## Persistence and bypass
 
 Barriers can be persistent or non-persistent:
@@ -50,8 +63,8 @@ Where persistent and non-persistent barriers overlap, the persistent barrier con
 
 The AutoHotkey proof of concept does not provide individual barrier configuration. It instead provides a toggleable **Corner barriers** option.
 
-When enabled, every monitor receives two barrier segments at each of its four corners: one segment extends from the corner along each of the two edges which meet there, covering 10% of that edge. These barriers prevent the pointer from leaving their owning monitor.
+When enabled, every monitor receives two barrier segments at each of its four corners: one segment extends from the corner along each of the two edges which meet there, covering 20% of that edge. These barriers prevent the pointer from leaving their owning monitor.
 
 Corner barriers are persistent and unidirectional. They apply whenever Monitor Lock and the option are enabled, including outside window move or resize operations, and cannot be disabled temporarily using bypass mode.
 
-The proof of concept uses event-driven mouse handling rather than continuously polling the pointer position.
+The proof of concept uses event-driven mouse handling rather than continuously polling the pointer position. Its low-level mouse hook uses the exact collision model above and evaluates the barriers from every monitor together.

@@ -26,7 +26,7 @@ Move or resize a window normally. While the drag is active, the pointer stays wi
 
 To cross into another monitor during a drag, press the secondary mouse button while continuing to hold the primary button. Press it again to restore the boundary.
 
-Enable **Corner barriers** to prevent the pointer from leaving any monitor through the first or last 10% of an edge. Corner barriers remain active outside window moves and resizes, and the secondary-button bypass does not disable them.
+Enable **Corner barriers** to prevent the pointer from leaving any monitor through the first or last 20% of an edge. Corner barriers remain active outside window moves and resizes, and the secondary-button bypass does not disable them.
 
 Right-click the tray icon to:
 

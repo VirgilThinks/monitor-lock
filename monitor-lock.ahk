@@ -22,7 +22,9 @@ global SM_CXVIRTUALSCREEN := 78
 global SM_CYVIRTUALSCREEN := 79
 global MONITOR_DEFAULTTONEAREST := 0x00000002
 global DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE := -3
-global CORNER_BARRIER_PROPORTION := 0.10
+global BARRIER_AXIS_X := 1
+global BARRIER_AXIS_Y := 2
+global CORNER_BARRIER_FRACTION_DENOMINATOR := 5
 
 global gEnabled := true
 global gCornerBarriersEnabled := false
@@ -43,7 +45,7 @@ global gWinEventCallback := 0
 global gWinEventHook := 0
 global gMouseHookCallback := 0
 global gMouseHook := 0
-global gCornerBarrierMonitorRects := []
+global gCornerBarriers := []
 global gLastPointerPositionKnown := false
 global gLastPointerX := 0
 global gLastPointerY := 0
@@ -223,7 +225,7 @@ StartCornerBarrierHook() {
     if gMouseHook
         return
 
-    RefreshCornerBarrierMonitorRects()
+    RefreshCornerBarriers()
 
     SeedLastPointerPosition()
 
@@ -281,13 +283,13 @@ StopCornerBarrierHook() {
 }
 
 
-; Cache complete monitor rectangles in physical pixels. The hook reads this
-; immutable snapshot rather than querying monitor topology for every movement.
-RefreshCornerBarrierMonitorRects() {
-    global gCornerBarrierMonitorRects
+; Build directed barriers in doubled physical-pixel coordinates. Odd boundary
+; coordinates lie exactly between the last pixel of one monitor and the next.
+RefreshCornerBarriers() {
+    global gCornerBarriers
 
     previousDpiContext := EnterPhysicalCoordinateContext()
-    monitorRects := []
+    barriers := []
 
     try {
         monitorCount := MonitorGetCount()
@@ -299,18 +301,129 @@ RefreshCornerBarrierMonitorRects() {
                 &right,
                 &bottom
             )
-            monitorRects.Push({
-                left: left,
-                top: top,
-                right: right,
-                bottom: bottom
-            })
+            AddMonitorCornerBarriers(
+                barriers,
+                left,
+                top,
+                right,
+                bottom
+            )
         }
     } finally {
         RestoreCoordinateContext(previousDpiContext)
     }
 
-    gCornerBarrierMonitorRects := monitorRects
+    gCornerBarriers := barriers
+}
+
+
+; Add two closed 20% segments to every edge. Spans use a shared integer scale
+; so percentage endpoints remain exact.
+AddMonitorCornerBarriers(barriers, left, top, right, bottom) {
+    global BARRIER_AXIS_X, BARRIER_AXIS_Y
+    global CORNER_BARRIER_FRACTION_DENOMINATOR
+
+    leftBoundary := 2 * left - 1
+    rightBoundary := 2 * right - 1
+    topBoundary := 2 * top - 1
+    bottomBoundary := 2 * bottom - 1
+    width := rightBoundary - leftBoundary
+    height := bottomBoundary - topBoundary
+    scale := CORNER_BARRIER_FRACTION_DENOMINATOR
+
+    AddBarrier(
+        barriers,
+        BARRIER_AXIS_X,
+        leftBoundary,
+        -1,
+        left,
+        topBoundary * scale,
+        topBoundary * scale + height
+    )
+    AddBarrier(
+        barriers,
+        BARRIER_AXIS_X,
+        leftBoundary,
+        -1,
+        left,
+        bottomBoundary * scale - height,
+        bottomBoundary * scale
+    )
+    AddBarrier(
+        barriers,
+        BARRIER_AXIS_X,
+        rightBoundary,
+        1,
+        right - 1,
+        topBoundary * scale,
+        topBoundary * scale + height
+    )
+    AddBarrier(
+        barriers,
+        BARRIER_AXIS_X,
+        rightBoundary,
+        1,
+        right - 1,
+        bottomBoundary * scale - height,
+        bottomBoundary * scale
+    )
+
+    AddBarrier(
+        barriers,
+        BARRIER_AXIS_Y,
+        topBoundary,
+        -1,
+        top,
+        leftBoundary * scale,
+        leftBoundary * scale + width
+    )
+    AddBarrier(
+        barriers,
+        BARRIER_AXIS_Y,
+        topBoundary,
+        -1,
+        top,
+        rightBoundary * scale - width,
+        rightBoundary * scale
+    )
+    AddBarrier(
+        barriers,
+        BARRIER_AXIS_Y,
+        bottomBoundary,
+        1,
+        bottom - 1,
+        leftBoundary * scale,
+        leftBoundary * scale + width
+    )
+    AddBarrier(
+        barriers,
+        BARRIER_AXIS_Y,
+        bottomBoundary,
+        1,
+        bottom - 1,
+        rightBoundary * scale - width,
+        rightBoundary * scale
+    )
+}
+
+
+AddBarrier(
+    barriers,
+    axis,
+    boundary,
+    outwardDirection,
+    insideCoordinate,
+    spanStartScaled,
+    spanEndScaled
+) {
+    barriers.Push({
+        axis: axis,
+        boundary: boundary,
+        outwardDirection: outwardDirection,
+        insideCoordinate: insideCoordinate,
+        spanStartScaled: spanStartScaled,
+        spanEndScaled: spanEndScaled
+    })
 }
 
 
@@ -371,11 +484,15 @@ LowLevelMouseProc(nCode, wParam, lParam) {
             return CallNextMouseHook(nCode, wParam, lParam)
         }
 
+        cursorMustMove := constrainedPosition[1] != gLastPointerX
+            || constrainedPosition[2] != gLastPointerY
+
         ; Set the accepted position first so a movement generated by SetCursorPos
         ; cannot be mistaken for another attempted crossing.
         gLastPointerX := constrainedPosition[1]
         gLastPointerY := constrainedPosition[2]
-        SetPhysicalCursorPosition(gLastPointerX, gLastPointerY)
+        if cursorMustMove
+            SetPhysicalCursorPosition(gLastPointerX, gLastPointerY)
         return 1
     } catch Error as err {
         gCornerBarrierFaulted := true
@@ -418,128 +535,282 @@ HandleCornerBarrierError() {
 }
 
 
-; Return a corrected position when a movement leaves its source monitor through
-; either 10% corner section of an edge. A missing result means no barrier.
+; Sweep the proposed movement against every directed barrier. All barriers at
+; the earliest collision are resolved together, including both sides of a corner.
 ConstrainCornerBarrierMovement(fromX, fromY, proposedX, proposedY) {
-    monitorRect := FindMonitorRectContainingPoint(fromX, fromY)
-    if !IsObject(monitorRect)
+    global BARRIER_AXIS_X, BARRIER_AXIS_Y
+
+    collision := FindEarliestBarrierCollision(
+        2 * fromX,
+        2 * fromY,
+        2 * proposedX,
+        2 * proposedY
+    )
+    if !IsObject(collision)
         return 0
 
     constrainedX := proposedX
     constrainedY := proposedY
-    movementWasConstrained := false
+    blocksX := false
+    blocksY := false
 
-    if proposedX < monitorRect.left {
-        crossingY := InterpolateYAtX(
-            fromX,
-            fromY,
-            proposedX,
-            proposedY,
-            monitorRect.left
-        )
-        if IsInCornerSection(
-            crossingY,
-            monitorRect.top,
-            monitorRect.bottom
-        ) {
-            constrainedX := monitorRect.left
-            movementWasConstrained := true
-        }
-    } else if proposedX >= monitorRect.right {
-        crossingY := InterpolateYAtX(
-            fromX,
-            fromY,
-            proposedX,
-            proposedY,
-            monitorRect.right
-        )
-        if IsInCornerSection(
-            crossingY,
-            monitorRect.top,
-            monitorRect.bottom
-        ) {
-            constrainedX := monitorRect.right - 1
-            movementWasConstrained := true
+    for candidate in collision.candidates {
+        barrier := candidate.barrier
+        if barrier.axis = BARRIER_AXIS_X {
+            blocksX := true
+            constrainedX := barrier.insideCoordinate
+            collisionXBoundary := barrier.boundary
+            collisionYNumber := candidate.tangentNumber
+            collisionYDenominator := candidate.tangentDenominator
+        } else if barrier.axis = BARRIER_AXIS_Y {
+            blocksY := true
+            constrainedY := barrier.insideCoordinate
+            collisionYBoundary := barrier.boundary
+            collisionXNumber := candidate.tangentNumber
+            collisionXDenominator := candidate.tangentDenominator
         }
     }
 
-    if proposedY < monitorRect.top {
-        crossingX := InterpolateXAtY(
-            fromX,
-            fromY,
-            proposedX,
-            proposedY,
-            monitorRect.top
+    ; After the first collision, sweep any remaining tangential movement. This
+    ; allows sliding while still detecting a second barrier reached at a corner.
+    if blocksX && !blocksY {
+        slideCollision := FindEarliestBarrierCollisionOnSlide(
+            BARRIER_AXIS_Y,
+            collisionXBoundary,
+            collisionYNumber,
+            collisionYDenominator,
+            2 * proposedY
         )
-        if IsInCornerSection(
-            crossingX,
-            monitorRect.left,
-            monitorRect.right
-        ) {
-            constrainedY := monitorRect.top
-            movementWasConstrained := true
+        if IsObject(slideCollision) {
+            blocksY := true
+            constrainedY := slideCollision.candidates[1].barrier.insideCoordinate
         }
-    } else if proposedY >= monitorRect.bottom {
-        crossingX := InterpolateXAtY(
-            fromX,
-            fromY,
-            proposedX,
-            proposedY,
-            monitorRect.bottom
+    } else if blocksY && !blocksX {
+        slideCollision := FindEarliestBarrierCollisionOnSlide(
+            BARRIER_AXIS_X,
+            collisionYBoundary,
+            collisionXNumber,
+            collisionXDenominator,
+            2 * proposedX
         )
-        if IsInCornerSection(
-            crossingX,
-            monitorRect.left,
-            monitorRect.right
-        ) {
-            constrainedY := monitorRect.bottom - 1
-            movementWasConstrained := true
+        if IsObject(slideCollision) {
+            blocksX := true
+            constrainedX := slideCollision.candidates[1].barrier.insideCoordinate
         }
     }
-
-    if !movementWasConstrained
-        return 0
 
     return [constrainedX, constrainedY]
 }
 
 
-FindMonitorRectContainingPoint(x, y) {
-    global gCornerBarrierMonitorRects
+; Find all barriers reached at the earliest exact rational time on a movement.
+FindEarliestBarrierCollision(fromX, fromY, toX, toY) {
+    global BARRIER_AXIS_X, BARRIER_AXIS_Y, gCornerBarriers
 
-    for monitorRect in gCornerBarrierMonitorRects {
-        if x >= monitorRect.left
-            && x < monitorRect.right
-            && y >= monitorRect.top
-            && y < monitorRect.bottom
-            return monitorRect
+    earliestCandidates := []
+    earliestTimeNumber := 0
+    earliestTimeDenominator := 1
+
+    for barrier in gCornerBarriers {
+        if barrier.axis = BARRIER_AXIS_X {
+            candidate := GetBarrierCollision(
+                barrier,
+                fromX,
+                toX,
+                fromY,
+                toY
+            )
+        } else if barrier.axis = BARRIER_AXIS_Y {
+            candidate := GetBarrierCollision(
+                barrier,
+                fromY,
+                toY,
+                fromX,
+                toX
+            )
+        } else {
+            continue
+        }
+
+        if !IsObject(candidate)
+            continue
+
+        if earliestCandidates.Length = 0
+            || FractionIsLess(
+                candidate.timeNumber,
+                candidate.timeDenominator,
+                earliestTimeNumber,
+                earliestTimeDenominator
+            ) {
+            earliestCandidates := [candidate]
+            earliestTimeNumber := candidate.timeNumber
+            earliestTimeDenominator := candidate.timeDenominator
+        } else if FractionsAreEqual(
+            candidate.timeNumber,
+            candidate.timeDenominator,
+            earliestTimeNumber,
+            earliestTimeDenominator
+        ) {
+            earliestCandidates.Push(candidate)
+        }
     }
 
-    return 0
+    if earliestCandidates.Length = 0
+        return 0
+
+    return {
+        candidates: earliestCandidates,
+        timeNumber: earliestTimeNumber,
+        timeDenominator: earliestTimeDenominator
+    }
 }
 
 
-IsInCornerSection(position, edgeStart, edgeEnd) {
-    global CORNER_BARRIER_PROPORTION
+; Return a collision only when movement goes from a barrier's permitted side to
+; its forbidden side and the exact crossing lies on the closed barrier segment.
+GetBarrierCollision(
+    barrier,
+    fromNormal,
+    toNormal,
+    fromTangent,
+    toTangent
+) {
+    fromDistance := barrier.outwardDirection
+        * (fromNormal - barrier.boundary)
+    toDistance := barrier.outwardDirection
+        * (toNormal - barrier.boundary)
 
-    barrierLength := (edgeEnd - edgeStart) * CORNER_BARRIER_PROPORTION
+    if fromDistance > 0 || toDistance <= 0
+        return 0
 
-    return position >= edgeStart
-        && position <= edgeStart + barrierLength
-        || position >= edgeEnd - barrierLength
-        && position <= edgeEnd
+    timeNumber := barrier.boundary - fromNormal
+    timeDenominator := toNormal - fromNormal
+    if timeDenominator < 0 {
+        timeNumber := -timeNumber
+        timeDenominator := -timeDenominator
+    }
+
+    if timeNumber < 0 || timeNumber > timeDenominator
+        return 0
+
+    tangentNumber := fromTangent * timeDenominator
+        + (toTangent - fromTangent) * timeNumber
+    if !BarrierContainsRationalPosition(
+        barrier,
+        tangentNumber,
+        timeDenominator
+    )
+        return 0
+
+    return {
+        barrier: barrier,
+        timeNumber: timeNumber,
+        timeDenominator: timeDenominator,
+        tangentNumber: tangentNumber,
+        tangentDenominator: timeDenominator
+    }
 }
 
 
-InterpolateYAtX(fromX, fromY, toX, toY, crossingX) {
-    progress := (crossingX - fromX) / (toX - fromX)
-    return fromY + (toY - fromY) * progress
+; A first collision leaves movement along one axis. Sweep that exact rational
+; segment so sliding into another barrier is resolved in the same input update.
+FindEarliestBarrierCollisionOnSlide(
+    barrierAxis,
+    fixedTangent,
+    fromNormalNumber,
+    fromNormalDenominator,
+    toNormal
+) {
+    global gCornerBarriers
+
+    earliestCandidates := []
+    earliestTimeNumber := 0
+    earliestTimeDenominator := 1
+
+    for barrier in gCornerBarriers {
+        if barrier.axis != barrierAxis
+            continue
+
+        if !BarrierContainsRationalPosition(barrier, fixedTangent, 1)
+            continue
+
+        fromDistanceNumber := barrier.outwardDirection
+            * (
+                fromNormalNumber
+                - barrier.boundary * fromNormalDenominator
+            )
+        toDistance := barrier.outwardDirection
+            * (toNormal - barrier.boundary)
+        if fromDistanceNumber > 0 || toDistance <= 0
+            continue
+
+        timeNumber := barrier.boundary * fromNormalDenominator
+            - fromNormalNumber
+        timeDenominator := toNormal * fromNormalDenominator
+            - fromNormalNumber
+        if timeDenominator < 0 {
+            timeNumber := -timeNumber
+            timeDenominator := -timeDenominator
+        }
+
+        if timeNumber < 0 || timeNumber > timeDenominator
+            continue
+
+        candidate := {
+            barrier: barrier,
+            timeNumber: timeNumber,
+            timeDenominator: timeDenominator
+        }
+        if earliestCandidates.Length = 0
+            || FractionIsLess(
+                timeNumber,
+                timeDenominator,
+                earliestTimeNumber,
+                earliestTimeDenominator
+            ) {
+            earliestCandidates := [candidate]
+            earliestTimeNumber := timeNumber
+            earliestTimeDenominator := timeDenominator
+        } else if FractionsAreEqual(
+            timeNumber,
+            timeDenominator,
+            earliestTimeNumber,
+            earliestTimeDenominator
+        ) {
+            earliestCandidates.Push(candidate)
+        }
+    }
+
+    if earliestCandidates.Length = 0
+        return 0
+
+    return {
+        candidates: earliestCandidates,
+        timeNumber: earliestTimeNumber,
+        timeDenominator: earliestTimeDenominator
+    }
 }
 
 
-InterpolateXAtY(fromX, fromY, toX, toY, crossingY) {
-    progress := (crossingY - fromY) / (toY - fromY)
-    return fromX + (toX - fromX) * progress
+BarrierContainsRationalPosition(barrier, positionNumber, positionDenominator) {
+    global CORNER_BARRIER_FRACTION_DENOMINATOR
+
+    scale := CORNER_BARRIER_FRACTION_DENOMINATOR
+    scaledPosition := positionNumber * scale
+    return scaledPosition >= barrier.spanStartScaled * positionDenominator
+        && scaledPosition <= barrier.spanEndScaled * positionDenominator
+}
+
+
+FractionIsLess(leftNumber, leftDenominator, rightNumber, rightDenominator) {
+    return leftNumber * rightDenominator
+        < rightNumber * leftDenominator
+}
+
+
+FractionsAreEqual(leftNumber, leftDenominator, rightNumber, rightDenominator) {
+    return leftNumber * rightDenominator
+        = rightNumber * leftDenominator
 }
 
 
@@ -966,7 +1237,7 @@ RefreshAfterDisplayChange() {
 
     try {
         if gMouseHook {
-            RefreshCornerBarrierMonitorRects()
+            RefreshCornerBarriers()
             SeedLastPointerPosition()
         }
 

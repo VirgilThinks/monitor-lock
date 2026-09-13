@@ -9,9 +9,11 @@ Add persistent corner barriers to the existing AutoHotkey tray utility without i
 ## Work
 
 * Added tray state and low-level mouse-hook lifecycle management.
-* Physical monitor rectangles are cached and refreshed after display changes.
-* Added path-intersection detection for corner sections of the source monitor's edges.
-* Blocked movements are suppressed and replaced with a position which preserves sliding along the barrier.
+* A global directed barrier list is cached and refreshed after display changes.
+* Added exact swept-segment intersection using doubled integer coordinates and rational comparisons.
+* All barriers reached at the earliest collision are combined, and remaining slide movement is checked for another collision.
+* Blocked movements are suppressed and replaced with a position which preserves permitted sliding along the barrier.
+* Repeated blocked events which leave the pointer unchanged no longer call `SetCursorPos`.
 * Hook resources are released during disablement, errors and exit.
 
 
@@ -19,7 +21,7 @@ Add persistent corner barriers to the existing AutoHotkey tray utility without i
 
 Implementation is complete. Runtime validation remains outstanding.
 
-Static inspection confirms that tray toggles, hook lifecycle, display refresh, source-monitor collision handling and deferred callback error handling are connected. Behaviour on a live multi-monitor desktop remains unverified.
+Static inspection confirms that tray toggles, hook lifecycle, display refresh, global collision handling and deferred callback error handling are connected. The reported exact-corner tunnelling case now produces simultaneous collisions with both adjacent barriers by construction. Behaviour on a live multi-monitor desktop remains unverified.
 
 
 ## Completion criteria
