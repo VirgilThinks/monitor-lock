@@ -8,4 +8,4 @@ It is an AutoHotkey script.
 
 Development will remain focused on the AutoHotkey script for now. We may also explore a simple, independent Windows programme if there is a good reason to move beyond AutoHotkey, and may maintain both routes in parallel if each proves useful.
 
-The next planned AutoHotkey proof of concept is a toggleable [Corner barriers](planned/barriers.md) option. It will use event-driven mouse handling rather than continuously polling the pointer position.
+The AutoHotkey proof of concept provides a toggleable [Corner barriers](planned/barriers.md) option. Its persistent, unidirectional barriers use event-driven mouse handling rather than continuously polling the pointer position.

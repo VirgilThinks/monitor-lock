@@ -10,6 +10,8 @@ global EVENT_SYSTEM_MOVESIZEEND := 0x000B
 global WINEVENT_OUTOFCONTEXT := 0x0000
 global WINEVENT_SKIPOWNPROCESS := 0x0002
 global WM_DISPLAYCHANGE := 0x007E
+global WM_MOUSEMOVE := 0x0200
+global WH_MOUSE_LL := 14
 
 global VK_LBUTTON := 0x01
 global VK_RBUTTON := 0x02
@@ -20,8 +22,10 @@ global SM_CXVIRTUALSCREEN := 78
 global SM_CYVIRTUALSCREEN := 79
 global MONITOR_DEFAULTTONEAREST := 0x00000002
 global DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE := -3
+global CORNER_BARRIER_PROPORTION := 0.10
 
 global gEnabled := true
+global gCornerBarriersEnabled := false
 global gMoveSizeActive := false
 global gMoveSizeWindow := 0
 global gBoundaryBypass := false
@@ -37,6 +41,14 @@ global gOwnedBottom := 0
 
 global gWinEventCallback := 0
 global gWinEventHook := 0
+global gMouseHookCallback := 0
+global gMouseHook := 0
+global gCornerBarrierMonitorRects := []
+global gLastPointerPositionKnown := false
+global gLastPointerX := 0
+global gLastPointerY := 0
+global gCornerBarrierFaulted := false
+global gCornerBarrierError := 0
 global gStartupShortcut := A_Startup "\AHK Monitor Lock.lnk"
 
 Initialise()
@@ -72,6 +84,8 @@ Initialise() {
         gWinEventCallback := 0
         throw OSError(errorCode, "SetWinEventHook")
     }
+
+    SyncCornerBarrierHook()
 }
 
 
@@ -80,6 +94,7 @@ ConfigureTray() {
 
     A_TrayMenu.Delete()
     A_TrayMenu.Add("Enabled", ToggleEnabled)
+    A_TrayMenu.Add("Corner barriers", ToggleCornerBarriers)
     A_TrayMenu.Add("Start with Windows", ToggleStartup)
     A_TrayMenu.Add()
     A_TrayMenu.Add("Exit", ExitRequested)
@@ -91,12 +106,17 @@ ConfigureTray() {
 
 
 SyncTrayChecks() {
-    global gEnabled
+    global gEnabled, gCornerBarriersEnabled
 
     if gEnabled
         A_TrayMenu.Check("Enabled")
     else
         A_TrayMenu.Uncheck("Enabled")
+
+    if gCornerBarriersEnabled
+        A_TrayMenu.Check("Corner barriers")
+    else
+        A_TrayMenu.Uncheck("Corner barriers")
 
     if IsStartupEnabled()
         A_TrayMenu.Check("Start with Windows")
@@ -110,11 +130,32 @@ ToggleEnabled(*) {
 
     gEnabled := !gEnabled
 
-    if gEnabled {
-        if gMoveSizeActive
-            StartGuard()
-    } else {
-        StopGuard()
+    try {
+        if gEnabled {
+            if gMoveSizeActive
+                StartGuard()
+            SyncCornerBarrierHook()
+        } else {
+            StopGuard()
+            StopCornerBarrierHook()
+        }
+    } catch Error as err {
+        DisableAfterError(err)
+    }
+
+    SyncTrayChecks()
+}
+
+
+ToggleCornerBarriers(*) {
+    global gCornerBarriersEnabled
+
+    gCornerBarriersEnabled := !gCornerBarriersEnabled
+
+    try {
+        SyncCornerBarrierHook()
+    } catch Error as err {
+        DisableAfterError(err)
     }
 
     SyncTrayChecks()
@@ -158,6 +199,389 @@ ToggleStartup(*) {
 IsStartupEnabled() {
     global gStartupShortcut
     return FileExist(gStartupShortcut) != ""
+}
+
+
+; Install the low-level hook only while persistent corner barriers are active.
+; This keeps normal idle mouse input outside AutoHotkey when the option is off.
+SyncCornerBarrierHook() {
+    global gEnabled, gCornerBarriersEnabled
+
+    if gEnabled && gCornerBarriersEnabled
+        StartCornerBarrierHook()
+    else
+        StopCornerBarrierHook()
+}
+
+
+; Prepare physical monitor geometry before enabling the event-driven mouse hook.
+StartCornerBarrierHook() {
+    global WH_MOUSE_LL
+    global gMouseHookCallback, gMouseHook
+    global gCornerBarrierFaulted, gCornerBarrierError
+
+    if gMouseHook
+        return
+
+    RefreshCornerBarrierMonitorRects()
+
+    SeedLastPointerPosition()
+
+    gCornerBarrierFaulted := false
+    gCornerBarrierError := 0
+    gMouseHookCallback := CallbackCreate(LowLevelMouseProc, , 3)
+
+    moduleHandle := DllCall(
+        "kernel32\GetModuleHandleW",
+        "Ptr", 0,
+        "Ptr"
+    )
+    gMouseHook := DllCall(
+        "user32\SetWindowsHookExW",
+        "Int", WH_MOUSE_LL,
+        "Ptr", gMouseHookCallback,
+        "Ptr", moduleHandle,
+        "UInt", 0,
+        "Ptr"
+    )
+
+    if !gMouseHook {
+        errorCode := A_LastError
+        CallbackFree(gMouseHookCallback)
+        gMouseHookCallback := 0
+        throw OSError(errorCode, "SetWindowsHookExW")
+    }
+}
+
+
+; Remove the hook before freeing its AutoHotkey callback. If Windows refuses to
+; remove it, retain the callback so that no installed hook points at freed code.
+StopCornerBarrierHook() {
+    global gMouseHookCallback, gMouseHook
+    global gLastPointerPositionKnown
+
+    if gMouseHook {
+        if !DllCall(
+            "user32\UnhookWindowsHookEx",
+            "Ptr", gMouseHook,
+            "Int"
+        )
+            return false
+
+        gMouseHook := 0
+    }
+
+    if gMouseHookCallback {
+        CallbackFree(gMouseHookCallback)
+        gMouseHookCallback := 0
+    }
+
+    gLastPointerPositionKnown := false
+    return true
+}
+
+
+; Cache complete monitor rectangles in physical pixels. The hook reads this
+; immutable snapshot rather than querying monitor topology for every movement.
+RefreshCornerBarrierMonitorRects() {
+    global gCornerBarrierMonitorRects
+
+    previousDpiContext := EnterPhysicalCoordinateContext()
+    monitorRects := []
+
+    try {
+        monitorCount := MonitorGetCount()
+        Loop monitorCount {
+            MonitorGet(
+                A_Index,
+                &left,
+                &top,
+                &right,
+                &bottom
+            )
+            monitorRects.Push({
+                left: left,
+                top: top,
+                right: right,
+                bottom: bottom
+            })
+        }
+    } finally {
+        RestoreCoordinateContext(previousDpiContext)
+    }
+
+    gCornerBarrierMonitorRects := monitorRects
+}
+
+
+SeedLastPointerPosition() {
+    global gLastPointerPositionKnown, gLastPointerX, gLastPointerY
+
+    cursorPosition := GetPhysicalCursorPosition()
+    if IsObject(cursorPosition) {
+        gLastPointerPositionKnown := true
+        gLastPointerX := cursorPosition[1]
+        gLastPointerY := cursorPosition[2]
+    } else {
+        gLastPointerPositionKnown := false
+    }
+}
+
+
+; Process only pointer movement. A handled movement is replaced with a clamped
+; position and suppressed; all other mouse events continue down the hook chain.
+LowLevelMouseProc(nCode, wParam, lParam) {
+    global WM_MOUSEMOVE
+    global gEnabled, gCornerBarriersEnabled
+    global gLastPointerPositionKnown, gLastPointerX, gLastPointerY
+    global gCornerBarrierFaulted, gCornerBarrierError
+
+    Critical("On")
+
+    if nCode < 0
+        return CallNextMouseHook(nCode, wParam, lParam)
+
+    if wParam != WM_MOUSEMOVE
+        return CallNextMouseHook(nCode, wParam, lParam)
+
+    if !gEnabled || !gCornerBarriersEnabled || gCornerBarrierFaulted
+        return CallNextMouseHook(nCode, wParam, lParam)
+
+    try {
+        proposedX := NumGet(lParam, 0, "Int")
+        proposedY := NumGet(lParam, 4, "Int")
+
+        if !gLastPointerPositionKnown {
+            gLastPointerPositionKnown := true
+            gLastPointerX := proposedX
+            gLastPointerY := proposedY
+            return CallNextMouseHook(nCode, wParam, lParam)
+        }
+
+        constrainedPosition := ConstrainCornerBarrierMovement(
+            gLastPointerX,
+            gLastPointerY,
+            proposedX,
+            proposedY
+        )
+
+        if !IsObject(constrainedPosition) {
+            gLastPointerX := proposedX
+            gLastPointerY := proposedY
+            return CallNextMouseHook(nCode, wParam, lParam)
+        }
+
+        ; Set the accepted position first so a movement generated by SetCursorPos
+        ; cannot be mistaken for another attempted crossing.
+        gLastPointerX := constrainedPosition[1]
+        gLastPointerY := constrainedPosition[2]
+        SetPhysicalCursorPosition(gLastPointerX, gLastPointerY)
+        return 1
+    } catch Error as err {
+        gCornerBarrierFaulted := true
+        gCornerBarrierError := err
+        SetTimer(HandleCornerBarrierError, -1)
+        return CallNextMouseHook(nCode, wParam, lParam)
+    }
+}
+
+
+CallNextMouseHook(nCode, wParam, lParam) {
+    global gMouseHook
+
+    return DllCall(
+        "user32\CallNextHookEx",
+        "Ptr", gMouseHook,
+        "Int", nCode,
+        "Ptr", wParam,
+        "Ptr", lParam,
+        "Ptr"
+    )
+}
+
+
+; Defer failure handling until after the low-level callback has returned. Hook
+; teardown and tray updates are unsafe work for the time-critical callback.
+HandleCornerBarrierError() {
+    global gCornerBarrierFaulted, gCornerBarrierError
+
+    if !gCornerBarrierFaulted
+        return
+
+    if IsObject(gCornerBarrierError)
+        errorToReport := gCornerBarrierError
+    else
+        errorToReport := Error("Corner barrier mouse handling failed.")
+    gCornerBarrierFaulted := false
+    gCornerBarrierError := 0
+    DisableAfterError(errorToReport)
+}
+
+
+; Return a corrected position when a movement leaves its source monitor through
+; either 10% corner section of an edge. A missing result means no barrier.
+ConstrainCornerBarrierMovement(fromX, fromY, proposedX, proposedY) {
+    monitorRect := FindMonitorRectContainingPoint(fromX, fromY)
+    if !IsObject(monitorRect)
+        return 0
+
+    constrainedX := proposedX
+    constrainedY := proposedY
+    movementWasConstrained := false
+
+    if proposedX < monitorRect.left {
+        crossingY := InterpolateYAtX(
+            fromX,
+            fromY,
+            proposedX,
+            proposedY,
+            monitorRect.left
+        )
+        if IsInCornerSection(
+            crossingY,
+            monitorRect.top,
+            monitorRect.bottom
+        ) {
+            constrainedX := monitorRect.left
+            movementWasConstrained := true
+        }
+    } else if proposedX >= monitorRect.right {
+        crossingY := InterpolateYAtX(
+            fromX,
+            fromY,
+            proposedX,
+            proposedY,
+            monitorRect.right
+        )
+        if IsInCornerSection(
+            crossingY,
+            monitorRect.top,
+            monitorRect.bottom
+        ) {
+            constrainedX := monitorRect.right - 1
+            movementWasConstrained := true
+        }
+    }
+
+    if proposedY < monitorRect.top {
+        crossingX := InterpolateXAtY(
+            fromX,
+            fromY,
+            proposedX,
+            proposedY,
+            monitorRect.top
+        )
+        if IsInCornerSection(
+            crossingX,
+            monitorRect.left,
+            monitorRect.right
+        ) {
+            constrainedY := monitorRect.top
+            movementWasConstrained := true
+        }
+    } else if proposedY >= monitorRect.bottom {
+        crossingX := InterpolateXAtY(
+            fromX,
+            fromY,
+            proposedX,
+            proposedY,
+            monitorRect.bottom
+        )
+        if IsInCornerSection(
+            crossingX,
+            monitorRect.left,
+            monitorRect.right
+        ) {
+            constrainedY := monitorRect.bottom - 1
+            movementWasConstrained := true
+        }
+    }
+
+    if !movementWasConstrained
+        return 0
+
+    return [constrainedX, constrainedY]
+}
+
+
+FindMonitorRectContainingPoint(x, y) {
+    global gCornerBarrierMonitorRects
+
+    for monitorRect in gCornerBarrierMonitorRects {
+        if x >= monitorRect.left
+            && x < monitorRect.right
+            && y >= monitorRect.top
+            && y < monitorRect.bottom
+            return monitorRect
+    }
+
+    return 0
+}
+
+
+IsInCornerSection(position, edgeStart, edgeEnd) {
+    global CORNER_BARRIER_PROPORTION
+
+    barrierLength := (edgeEnd - edgeStart) * CORNER_BARRIER_PROPORTION
+
+    return position >= edgeStart
+        && position <= edgeStart + barrierLength
+        || position >= edgeEnd - barrierLength
+        && position <= edgeEnd
+}
+
+
+InterpolateYAtX(fromX, fromY, toX, toY, crossingX) {
+    progress := (crossingX - fromX) / (toX - fromX)
+    return fromY + (toY - fromY) * progress
+}
+
+
+InterpolateXAtY(fromX, fromY, toX, toY, crossingY) {
+    progress := (crossingY - fromY) / (toY - fromY)
+    return fromX + (toX - fromX) * progress
+}
+
+
+GetPhysicalCursorPosition() {
+    previousDpiContext := EnterPhysicalCoordinateContext()
+    pointBuffer := Buffer(8, 0)
+
+    try {
+        if !DllCall(
+            "user32\GetCursorPos",
+            "Ptr", pointBuffer.Ptr,
+            "Int"
+        )
+            return 0
+
+        return [
+            NumGet(pointBuffer, 0, "Int"),
+            NumGet(pointBuffer, 4, "Int")
+        ]
+    } finally {
+        RestoreCoordinateContext(previousDpiContext)
+    }
+}
+
+
+SetPhysicalCursorPosition(x, y) {
+    previousDpiContext := EnterPhysicalCoordinateContext()
+
+    try {
+        succeeded := DllCall(
+            "user32\SetCursorPos",
+            "Int", x,
+            "Int", y,
+            "Int"
+        )
+        errorCode := A_LastError
+    } finally {
+        RestoreCoordinateContext(previousDpiContext)
+    }
+
+    if !succeeded
+        throw OSError(errorCode, "SetCursorPos")
 }
 
 
@@ -531,16 +955,21 @@ RectToBuffer(rect) {
 
 HandleDisplayChange(*) {
     ; Allow Windows to publish the new monitor topology first.
-    SetTimer(RefreshClipAfterDisplayChange, -100)
+    SetTimer(RefreshAfterDisplayChange, -100)
 }
 
 
-RefreshClipAfterDisplayChange() {
-    global gEnabled, gMoveSizeActive, gBoundaryBypass
+RefreshAfterDisplayChange() {
+    global gEnabled, gMoveSizeActive, gBoundaryBypass, gMouseHook
 
     Critical("On")
 
     try {
+        if gMouseHook {
+            RefreshCornerBarrierMonitorRects()
+            SeedLastPointerPosition()
+        }
+
         if !gEnabled || !gMoveSizeActive || gBoundaryBypass
             return
 
@@ -563,6 +992,9 @@ DisableAfterError(err) {
         StopGuard()
     }
     try {
+        StopCornerBarrierHook()
+    }
+    try {
         SyncTrayChecks()
     }
     try {
@@ -578,6 +1010,9 @@ CleanupOnUnhandledError(thrownValue, mode) {
     try {
         StopGuard()
     }
+    try {
+        StopCornerBarrierHook()
+    }
 
     ; Preserve AutoHotkey's normal error reporting after cleanup.
     return false
@@ -591,8 +1026,9 @@ CleanupOnExit(*) {
 
     try {
         SetTimer(ActiveDragTick, 0)
-        SetTimer(RefreshClipAfterDisplayChange, 0)
+        SetTimer(RefreshAfterDisplayChange, 0)
         ReleaseOwnedClip()
+        StopCornerBarrierHook()
     }
 
     if gWinEventHook {

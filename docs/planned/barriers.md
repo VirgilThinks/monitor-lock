@@ -48,10 +48,10 @@ Where persistent and non-persistent barriers overlap, the persistent barrier con
 
 ## AutoHotkey proof of concept
 
-The AutoHotkey proof of concept will not provide individual barrier configuration. It will instead provide a toggleable **Corner barriers** option.
+The AutoHotkey proof of concept does not provide individual barrier configuration. It instead provides a toggleable **Corner barriers** option.
 
-When enabled, every monitor receives two 100-physical-pixel barrier segments at each of its four corners: one segment extends from the corner along each of the two edges which meet there. These barriers prevent the pointer from leaving their owning monitor.
+When enabled, every monitor receives two barrier segments at each of its four corners: one segment extends from the corner along each of the two edges which meet there, covering 10% of that edge. These barriers prevent the pointer from leaving their owning monitor.
 
-Corner barriers are non-persistent. They apply while a window is being moved or resized and can be disabled temporarily using the normal toggleable bypass mode.
+Corner barriers are persistent and unidirectional. They apply whenever Monitor Lock and the option are enabled, including outside window move or resize operations, and cannot be disabled temporarily using bypass mode.
 
-The proof of concept should use event-driven mouse handling rather than continuously polling the pointer position.
+The proof of concept uses event-driven mouse handling rather than continuously polling the pointer position.
